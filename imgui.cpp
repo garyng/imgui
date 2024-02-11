@@ -3002,9 +3002,27 @@ static bool ImGuiListClipper_StepInternal(ImGuiListClipper* clipper)
                 data->Ranges.push_back(ImGuiListClipperRange::FromPositions(nav_rect_abs.Min.y, nav_rect_abs.Max.y, 0, 0));
 
             // Add visible range
+            float min_y = window->ClipRect.Min.y;
+            float max_y = window->ClipRect.Max.y;
+
+            // Add box selection range
+            ImGuiBoxSelectState* bs = &g.BoxSelectState;
+            if (bs->IsActive && bs->Window == window)
+            {
+                // FIXME: Selectable() use of half-ItemSpacing isn't consistent in matter of layout, as ItemAdd(bb) stray above ItemSize()'s CursorPos.
+                // RangeSelect's BoxSelect relies on comparing overlap of previous and current rectangle and is sensitive to that.
+                // As a workaround we currently half ItemSpacing worth on each side.
+                min_y -= g.Style.ItemSpacing.y;
+                max_y += g.Style.ItemSpacing.y;
+
+                // Box-select on 2D area requires different clipping.
+                if (bs->UnclipMode)
+                    data->Ranges.push_back(ImGuiListClipperRange::FromPositions(bs->UnclipRect.Min.y, bs->UnclipRect.Max.y, 0, 0));
+            }
+
             const int off_min = (is_nav_request && g.NavMoveClipDir == ImGuiDir_Up) ? -1 : 0;
             const int off_max = (is_nav_request && g.NavMoveClipDir == ImGuiDir_Down) ? 1 : 0;
-            data->Ranges.push_back(ImGuiListClipperRange::FromPositions(window->ClipRect.Min.y, window->ClipRect.Max.y, off_min, off_max));
+            data->Ranges.push_back(ImGuiListClipperRange::FromPositions(min_y, max_y, off_min, off_max));
         }
 
         // Convert position ranges to item index ranges
@@ -3757,6 +3775,9 @@ void ImGui::Shutdown()
     g.TablesTempData.clear_destruct();
     g.DrawChannelsTempMergeBuffer.clear();
 
+    g.MultiSelectStorage.Clear();
+    g.MultiSelectTempData.clear_destruct();
+
     g.ClipboardHandlerData.clear();
     g.MenusIdSubmittedThisFrame.clear();
     g.InputTextState.ClearFreeMemory();
@@ -3910,6 +3931,8 @@ void ImGui::GcCompactTransientMiscBuffers()
     ImGuiContext& g = *GImGui;
     g.ItemFlagsStack.clear();
     g.GroupStack.clear();
+    g.MultiSelectTempDataStacked = 0;
+    g.MultiSelectTempData.clear_destruct();
     TableGcCompactSettings();
 }
 
@@ -5578,9 +5601,15 @@ bool ImGui::IsItemToggledOpen()
     return (g.LastItemData.StatusFlags & ImGuiItemStatusFlags_ToggledOpen) ? true : false;
 }
 
+// Call after a Selectable() or TreeNode() involved in multi-selection.
+// Useful if you need the per-item information before reaching EndMultiSelect(), e.g. for rendering purpose.
+// This is only meant to be called inside a BeginMultiSelect()/EndMultiSelect() block.
+// (Outside of multi-select, it would be misleading/ambiguous to report this signal, as widgets
+// return e.g. a pressed event and user code is in charge of altering selection in ways we cannot predict.)
 bool ImGui::IsItemToggledSelection()
 {
     ImGuiContext& g = *GImGui;
+    IM_ASSERT(g.CurrentMultiSelect != NULL); // Can only be used inside a BeginMultiSelect()/EndMultiSelect()
     return (g.LastItemData.StatusFlags & ImGuiItemStatusFlags_ToggledSelection) ? true : false;
 }
 
@@ -10354,6 +10383,11 @@ void    ImGui::ErrorCheckEndWindowRecover(ImGuiErrorLogCallback log_callback, vo
         if (log_callback) log_callback(user_data, "Recovered from missing EndTabBar() in '%s'", window->Name);
         EndTabBar();
     }
+    while (g.CurrentMultiSelect != NULL && g.CurrentMultiSelect->Storage->Window == window)
+    {
+        if (log_callback) log_callback(user_data, "Recovered from missing EndMultiSelect() in '%s'", window->Name);
+        EndMultiSelect();
+    }
     while (window->DC.TreeDepth > 0)
     {
         if (log_callback) log_callback(user_data, "Recovered from missing TreePop() in '%s'", window->Name);
@@ -12554,6 +12588,7 @@ static void ImGui::NavUpdate()
 
     // Process navigation init request (select first/default focus)
     g.NavJustMovedToId = 0;
+    g.NavJustMovedToFocusScopeId = g.NavJustMovedFromFocusScopeId = 0;
     if (g.NavInitResult.ID != 0)
         NavInitRequestApplyResult();
     g.NavInitRequest = false;
@@ -12706,9 +12741,11 @@ void ImGui::NavInitRequestApplyResult()
     ImGuiNavItemData* result = &g.NavInitResult;
     if (g.NavId != result->ID)
     {
+        g.NavJustMovedFromFocusScopeId = g.NavFocusScopeId;
         g.NavJustMovedToId = result->ID;
         g.NavJustMovedToFocusScopeId = result->FocusScopeId;
         g.NavJustMovedToKeyMods = 0;
+        g.NavJustMovedToHasSelectionData = (result->InFlags & ImGuiItemFlags_HasSelectionUserData) != 0;
     }
 
     // Apply result from previous navigation init request (will typically select the first item, unless SetItemDefaultFocus() has been called)
@@ -12960,9 +12997,12 @@ void ImGui::NavMoveRequestApplyResult()
     // PageUp/PageDown however sets always set NavJustMovedTo (vs Home/End which doesn't) mimicking Windows behavior.
     if ((g.NavId != result->ID || (g.NavMoveFlags & ImGuiNavMoveFlags_IsPageMove)) && (g.NavMoveFlags & ImGuiNavMoveFlags_NoSelect) == 0)
     {
+        g.NavJustMovedFromFocusScopeId = g.NavFocusScopeId;
         g.NavJustMovedToId = result->ID;
         g.NavJustMovedToFocusScopeId = result->FocusScopeId;
         g.NavJustMovedToKeyMods = g.NavMoveKeyMods;
+        g.NavJustMovedToHasSelectionData = (result->InFlags & ImGuiItemFlags_HasSelectionUserData) != 0;
+        //IMGUI_DEBUG_LOG_NAV("[nav] NavJustMovedFromFocusScopeId = 0x%08X, NavJustMovedToFocusScopeId = 0x%08X\n", g.NavJustMovedFromFocusScopeId, g.NavJustMovedToFocusScopeId);
     }
 
     // Apply new NavID/Focus
@@ -13714,7 +13754,7 @@ bool ImGui::BeginDragDropTargetCustom(const ImRect& bb, ImGuiID id)
 
     IM_ASSERT(g.DragDropWithinTarget == false);
     g.DragDropTargetRect = bb;
-    g.DragDropTargetClipRect = window->ClipRect; // May want to be overriden by user depending on use case?
+    g.DragDropTargetClipRect = window->ClipRect; // May want to be overridden by user depending on use case?
     g.DragDropTargetId = id;
     g.DragDropWithinTarget = true;
     return true;
@@ -20164,6 +20204,17 @@ void ImGui::ShowMetricsWindow(bool* p_open)
         TreePop();
     }
 
+    // Details for MultiSelect
+    if (TreeNode("MultiSelect", "MultiSelect (%d)", g.MultiSelectStorage.GetAliveCount()))
+    {
+        ImGuiBoxSelectState* bs = &g.BoxSelectState;
+        BulletText("BoxSelect ID=0x%08X, Starting = %d, Active %d", bs->ID, bs->IsStarting, bs->IsActive);
+        for (int n = 0; n < g.MultiSelectStorage.GetMapSize(); n++)
+            if (ImGuiMultiSelectState* state = g.MultiSelectStorage.TryGetMapData(n))
+                DebugNodeMultiSelectState(state);
+        TreePop();
+    }
+
     // Details for Docking
 #ifdef IMGUI_HAS_DOCK
     if (TreeNode("Docking"))
@@ -21156,8 +21207,8 @@ void ImGui::ShowDebugLogWindow(bool* p_open)
     ShowDebugLogFlag("IO", ImGuiDebugLogFlags_EventIO);
     ShowDebugLogFlag("Nav", ImGuiDebugLogFlags_EventNav);
     ShowDebugLogFlag("Popup", ImGuiDebugLogFlags_EventPopup);
-    //ShowDebugLogFlag("Selection", ImGuiDebugLogFlags_EventSelection);
     ShowDebugLogFlag("Viewport", ImGuiDebugLogFlags_EventViewport);
+    ShowDebugLogFlag("Selection", ImGuiDebugLogFlags_EventSelection);
     ShowDebugLogFlag("InputRouting", ImGuiDebugLogFlags_EventInputRouting);
 
     if (SmallButton("Clear"))

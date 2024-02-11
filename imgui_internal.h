@@ -22,6 +22,7 @@ Index of this file:
 // [SECTION] Navigation support
 // [SECTION] Typing-select support
 // [SECTION] Columns support
+// [SECTION] Box-select support
 // [SECTION] Multi-select support
 // [SECTION] Docking support
 // [SECTION] Viewport support
@@ -121,6 +122,7 @@ struct ImBitVector;                 // Store 1-bit per value
 struct ImRect;                      // An axis-aligned rectangle (2 points)
 struct ImDrawDataBuilder;           // Helper to build a ImDrawData instance
 struct ImDrawListSharedData;        // Data shared between all ImDrawList instances
+struct ImGuiBoxSelectState;         // Box-selection state (currently used by multi-selection, could potentially be used by others)
 struct ImGuiColorMod;               // Stacked color modifier, backup of modified data so we can restore it
 struct ImGuiContext;                // Main Dear ImGui context
 struct ImGuiContextHook;            // Hook for extensions like ImGuiTestEngine
@@ -136,6 +138,8 @@ struct ImGuiInputTextDeactivateData;// Short term storage to backup text of a de
 struct ImGuiLastItemData;           // Status storage for last submitted items
 struct ImGuiLocEntry;               // A localization entry.
 struct ImGuiMenuColumns;            // Simple column measurement, currently used for MenuItem() only
+struct ImGuiMultiSelectState;       // Multi-selection persistent state (for focused selection).
+struct ImGuiMultiSelectTempData;    // Multi-selection temporary state (while traversing).
 struct ImGuiNavItemData;            // Result of a gamepad/keyboard directional navigation move query result
 struct ImGuiNavTreeNodeData;        // Temporary storage for last TreeNode() being a Left arrow landing candidate.
 struct ImGuiMetricsConfig;          // Storage for ShowMetricsWindow() and DebugNodeXXX() functions
@@ -494,6 +498,7 @@ static inline int    ImModPositive(int a, int b)                                
 static inline float  ImDot(const ImVec2& a, const ImVec2& b)                    { return a.x * b.x + a.y * b.y; }
 static inline ImVec2 ImRotate(const ImVec2& v, float cos_a, float sin_a)        { return ImVec2(v.x * cos_a - v.y * sin_a, v.x * sin_a + v.y * cos_a); }
 static inline float  ImLinearSweep(float current, float target, float speed)    { if (current < target) return ImMin(current + speed, target); if (current > target) return ImMax(current - speed, target); return current; }
+static inline float  ImLinearRemapClamp(float s0, float s1, float d0, float d1, float x) { return ImSaturate((x - s0) / (s1 - s0)) * (d1 - d0) + d0; }
 static inline ImVec2 ImMul(const ImVec2& lhs, const ImVec2& rhs)                { return ImVec2(lhs.x * rhs.x, lhs.y * rhs.y); }
 static inline bool   ImIsFloatAboveGuaranteedIntegerPrecision(float f)          { return f <= -16777216 || f >= 16777216; }
 static inline float  ImExponentialMovingAverage(float avg, float sample, int n) { avg -= avg / n; avg += sample / n; return avg; }
@@ -830,6 +835,7 @@ enum ImGuiItemFlags_
     // Controlled by widget code
     ImGuiItemFlags_Inputable                = 1 << 10, // false     // [WIP] Auto-activate input mode when tab focused. Currently only used and supported by a few items before it becomes a generic feature.
     ImGuiItemFlags_HasSelectionUserData     = 1 << 11, // false     // Set by SetNextItemSelectionUserData()
+    ImGuiItemFlags_IsMultiSelect            = 1 << 12, // false     // Set by SetNextItemSelectionUserData()
 };
 
 // Status flags for an already submitted item
@@ -1167,10 +1173,6 @@ struct ImGuiNextWindowData
     inline void ClearFlags()    { Flags = ImGuiNextWindowDataFlags_None; }
 };
 
-// Multi-Selection item index or identifier when using SetNextItemSelectionUserData()/BeginMultiSelect()
-// (Most users are likely to use this store an item INDEX but this may be used to store a POINTER as well.)
-typedef ImS64 ImGuiSelectionUserData;
-
 enum ImGuiNextItemDataFlags_
 {
     ImGuiNextItemDataFlags_None         = 0,
@@ -1182,8 +1184,9 @@ enum ImGuiNextItemDataFlags_
 struct ImGuiNextItemData
 {
     ImGuiNextItemDataFlags      Flags;
-    ImGuiItemFlags              ItemFlags;          // Currently only tested/used for ImGuiItemFlags_AllowOverlap.
+    ImGuiItemFlags              ItemFlags;          // Currently only tested/used for ImGuiItemFlags_AllowOverlap and ImGuiItemFlags_HasSelectionUserData.
     // Non-flags members are NOT cleared by ItemAdd() meaning they are still valid during NavProcessItem()
+    ImGuiID                     FocusScopeId;       // Set by SetNextItemSelectionUserData()
     ImGuiSelectionUserData      SelectionUserData;  // Set by SetNextItemSelectionUserData() (note that NULL/0 is a valid value, we use -1 == ImGuiSelectionUserData_Invalid to mark invalid values)
     float                       Width;              // Set by SetNextItemWidth()
     ImGuiKeyChord               Shortcut;           // Set by SetNextItemShortcut()
@@ -1615,7 +1618,7 @@ struct ImGuiNavItemData
     ImGuiID             FocusScopeId;   // Init,Move    // Best candidate focus scope ID
     ImRect              RectRel;        // Init,Move    // Best candidate bounding box in window relative space
     ImGuiItemFlags      InFlags;        // ????,Move    // Best candidate item flags
-    ImGuiSelectionUserData SelectionUserData;//I+Mov    // Best candidate SetNextItemSelectionData() value.
+    ImGuiSelectionUserData SelectionUserData;//I+Mov    // Best candidate SetNextItemSelectionUserData() value.
     float               DistBox;        //      Move    // Best candidate box distance to current NavId
     float               DistCenter;     //      Move    // Best candidate center distance to current NavId
     float               DistAxial;      //      Move    // Best candidate axial distance to current NavId
@@ -1724,6 +1727,33 @@ struct ImGuiOldColumns
 };
 
 //-----------------------------------------------------------------------------
+// [SECTION] Box-select support
+//-----------------------------------------------------------------------------
+
+struct ImGuiBoxSelectState
+{
+    // Active box-selection data (persistent, 1 active at a time)
+    ImGuiID                 ID;
+    bool                    IsActive;
+    bool                    IsStarting;
+    bool                    IsStartedFromVoid;  // Starting click was not from an item.
+    bool                    RequestClear;
+    ImGuiKeyChord           KeyMods : 16;       // Latched key-mods for box-select logic.
+    ImVec2                  StartPosRel;        // Start position in window-contents relative space (to support scrolling)
+    ImVec2                  EndPosRel;          // End position in window-contents relative space
+    ImVec2                  ScrollAccum;        // Scrolling accumulator (to behave at high-frame spaces)
+    ImGuiWindow*            Window;
+
+    // Temporary/Transient data
+    bool                    UnclipMode;         // (Temp/Transient, here in hot area). Set/cleared by the BeginMultiSelect()/EndMultiSelect() owning active box-select.
+    ImRect                  UnclipRect;         // Rectangle where ItemAdd() clipping may be temporarily disabled. Need support by multi-select supporting widgets.
+    ImRect                  BoxSelectRectPrev;  // Selection rectangle in absolute coordinates (derived every frame from BoxSelectStartPosRel and MousePos)
+    ImRect                  BoxSelectRectCurr;
+
+    ImGuiBoxSelectState()   { memset(this, 0, sizeof(*this)); }
+};
+
+//-----------------------------------------------------------------------------
 // [SECTION] Multi-select support
 //-----------------------------------------------------------------------------
 
@@ -1731,7 +1761,47 @@ struct ImGuiOldColumns
 #define ImGuiSelectionUserData_Invalid        ((ImGuiSelectionUserData)-1)
 
 #ifdef IMGUI_HAS_MULTI_SELECT
-// <this is filled in 'range_select' branch>
+
+// Temporary storage for multi-select
+struct IMGUI_API ImGuiMultiSelectTempData
+{
+    ImGuiMultiSelectIO      IO;                 // MUST BE FIRST FIELD. Requests are set and returned by BeginMultiSelect()/EndMultiSelect() + written to by user during the loop.
+    ImGuiMultiSelectState*  Storage;
+    ImGuiID                 FocusScopeId;       // Copied from g.CurrentFocusScopeId (unless another selection scope was pushed manually)
+    ImGuiMultiSelectFlags   Flags;
+    ImVec2                  ScopeRectMin;
+    ImVec2                  BackupCursorMaxPos;
+    ImGuiID                 BoxSelectId;
+    ImGuiKeyChord           KeyMods;
+    bool                    LoopRequestClear;
+    bool                    LoopRequestSelectAll;
+    bool                    IsEndIO;            // Set when switching IO from BeginMultiSelect() to EndMultiSelect() state.
+    bool                    IsFocused;          // Set if currently focusing the selection scope (any item of the selection). May be used if you have custom shortcut associated to selection.
+    bool                    IsSetRange;         // Set by BeginMultiSelect() when using Shift+Navigation. Because scrolling may be affected we can't afford a frame of lag with Shift+Navigation.
+    bool                    NavIdPassedBy;
+    bool                    RangeSrcPassedBy;   // Set by the item that matches RangeSrcItem.
+    bool                    RangeDstPassedBy;   // Set by the item that matches NavJustMovedToId when IsSetRange is set.
+    ImGuiSelectionUserData  BoxSelectLastitem;  // Copy of last submitted item data, used to merge output ranges.
+
+    ImGuiMultiSelectTempData()  { Clear(); }
+    void Clear()            { size_t io_sz = sizeof(IO); ClearIO(); memset((void*)(&IO + 1), 0, sizeof(*this) - io_sz); } // Zero-clear except IO as we preserve IO.Requests[] buffer allocation.
+    void ClearIO()          { IO.Requests.resize(0); IO.RangeSrcItem = IO.NavIdItem = (ImGuiSelectionUserData)-1; IO.NavIdSelected = IO.RangeSrcReset = false; }
+};
+
+// Persistent storage for multi-select (as long as selection is alive)
+struct IMGUI_API ImGuiMultiSelectState
+{
+    ImGuiWindow*            Window;
+    ImGuiID                 ID;
+    int                     LastFrameActive;    // Last used frame-count, for GC.
+    ImS8                    RangeSelected;      // -1 (don't have) or true/false
+    ImS8                    NavIdSelected;      // -1 (don't have) or true/false
+    ImGuiSelectionUserData  RangeSrcItem;       //
+    ImGuiSelectionUserData  NavIdItem;          // SetNextItemSelectionUserData() value for NavId (if part of submitted items)
+
+    ImGuiMultiSelectState() { Window = NULL; ID = 0; LastFrameActive = 0; RangeSelected = NavIdSelected = -1; RangeSrcItem = NavIdItem = ImGuiSelectionUserData_Invalid; }
+};
+
 #endif // #ifdef IMGUI_HAS_MULTI_SELECT
 
 //-----------------------------------------------------------------------------
@@ -2246,8 +2316,10 @@ struct ImGuiContext
     ImGuiID                 NavHighlightActivatedId;
     float                   NavHighlightActivatedTimer;
     ImGuiID                 NavJustMovedToId;                   // Just navigated to this id (result of a successfully MoveRequest).
+    ImGuiID                 NavJustMovedFromFocusScopeId;       // Just navigated from this focus scope id (result of a successfully MoveRequest).
     ImGuiID                 NavJustMovedToFocusScopeId;         // Just navigated to this focus scope id (result of a successfully MoveRequest).
     ImGuiKeyChord           NavJustMovedToKeyMods;
+    bool                    NavJustMovedToHasSelectionData;     // " (FIXME-NAV: We should maybe just store ImGuiNavMoveResult)
     ImGuiID                 NavNextActivateId;                  // Set by ActivateItem(), queued until next frame.
     ImGuiActivateFlags      NavNextActivateFlags;
     ImGuiInputSource        NavInputSource;                     // Keyboard or Gamepad mode? THIS CAN ONLY BE ImGuiInputSource_Keyboard or ImGuiInputSource_Mouse
@@ -2336,6 +2408,13 @@ struct ImGuiContext
     ImPool<ImGuiTabBar>             TabBars;
     ImVector<ImGuiPtrOrIndex>       CurrentTabBarStack;
     ImVector<ImGuiShrinkWidthItem>  ShrinkWidthBuffer;
+
+    // Multi-Select state
+    ImGuiBoxSelectState             BoxSelectState;
+    ImGuiMultiSelectTempData*       CurrentMultiSelect;
+    int                             MultiSelectTempDataStacked; // Temporary multi-select data size (because we leave previous instances undestructed, we generally don't use MultiSelectTempData.Size)
+    ImVector<ImGuiMultiSelectTempData> MultiSelectTempData;
+    ImPool<ImGuiMultiSelectState>   MultiSelectStorage;
 
     // Hover Delay system
     ImGuiID                 HoverItemDelayId;
@@ -2528,11 +2607,12 @@ struct ImGuiContext
 
         NavWindow = NULL;
         NavId = NavFocusScopeId = NavActivateId = NavActivateDownId = NavActivatePressedId = 0;
-        NavJustMovedToId = NavJustMovedToFocusScopeId = NavNextActivateId = 0;
+        NavJustMovedToId = NavJustMovedToFocusScopeId = NavJustMovedFromFocusScopeId = NavNextActivateId = 0;
         NavActivateFlags = NavNextActivateFlags = ImGuiActivateFlags_None;
         NavHighlightActivatedId = 0;
         NavHighlightActivatedTimer = 0.0f;
         NavJustMovedToKeyMods = ImGuiMod_None;
+        NavJustMovedToHasSelectionData = false;
         NavInputSource = ImGuiInputSource_Keyboard;
         NavLayer = ImGuiNavLayer_Main;
         NavLastValidSelectionUserData = ImGuiSelectionUserData_Invalid;
@@ -2580,6 +2660,8 @@ struct ImGuiContext
         CurrentTable = NULL;
         TablesTempDataStacked = 0;
         CurrentTabBar = NULL;
+        CurrentMultiSelect = NULL;
+        MultiSelectTempDataStacked = 0;
 
         HoverItemDelayId = HoverItemDelayIdPreviousFrame = HoverItemUnlockedStationaryId = HoverWindowUnlockedStationaryId = 0;
         HoverItemDelayTimer = HoverItemDelayClearTimer = 0.0f;
@@ -3247,6 +3329,7 @@ namespace ImGui
     inline ImRect           WindowRectAbsToRel(ImGuiWindow* window, const ImRect& r) { ImVec2 off = window->DC.CursorStartPos; return ImRect(r.Min.x - off.x, r.Min.y - off.y, r.Max.x - off.x, r.Max.y - off.y); }
     inline ImRect           WindowRectRelToAbs(ImGuiWindow* window, const ImRect& r) { ImVec2 off = window->DC.CursorStartPos; return ImRect(r.Min.x + off.x, r.Min.y + off.y, r.Max.x + off.x, r.Max.y + off.y); }
     inline ImVec2           WindowPosRelToAbs(ImGuiWindow* window, const ImVec2& p)  { ImVec2 off = window->DC.CursorStartPos; return ImVec2(p.x + off.x, p.y + off.y); }
+    inline ImVec2           WindowPosAbsToRel(ImGuiWindow* window, const ImVec2& p)  { ImVec2 off = window->DC.CursorStartPos; return ImVec2(p.x - off.x, p.y - off.y); }
 
     // Windows: Display Order and Focus Order
     IMGUI_API void          FocusWindow(ImGuiWindow* window, ImGuiFocusRequestFlags flags = 0);
@@ -3349,7 +3432,6 @@ namespace ImGui
     IMGUI_API ImVec2        CalcItemSize(ImVec2 size, float default_w, float default_h);
     IMGUI_API float         CalcWrapWidthForPos(const ImVec2& pos, float wrap_pos_x);
     IMGUI_API void          PushMultiItemsWidths(int components, float width_full);
-    IMGUI_API bool          IsItemToggledSelection();                                   // Was the last item selection toggled? (after Selectable(), TreeNode() etc. We only returns toggle _event_ in order to handle clipping correctly)
     IMGUI_API ImVec2        GetContentRegionMaxAbs();
     IMGUI_API void          ShrinkWidths(ImGuiShrinkWidthItem* items, int count, float width_excess);
 
@@ -3583,6 +3665,15 @@ namespace ImGui
     IMGUI_API int           TypingSelectFindNextSingleCharMatch(ImGuiTypingSelectRequest* req, int items_count, const char* (*get_item_name_func)(void*, int), void* user_data, int nav_item_idx);
     IMGUI_API int           TypingSelectFindBestLeadingMatch(ImGuiTypingSelectRequest* req, int items_count, const char* (*get_item_name_func)(void*, int), void* user_data);
 
+    // Box-Select API
+    IMGUI_API bool          BeginBoxSelect(ImGuiWindow* window, ImGuiID box_select_id, ImGuiMultiSelectFlags ms_flags);
+    IMGUI_API void          EndBoxSelect(const ImRect& scope_rect, bool enable_scroll);
+
+    // Multi-Select API
+    IMGUI_API void          MultiSelectItemHeader(ImGuiID id, bool* p_selected, ImGuiButtonFlags* p_button_flags);
+    IMGUI_API void          MultiSelectItemFooter(ImGuiID id, bool* p_selected, bool* p_pressed);
+    inline ImGuiBoxSelectState* GetBoxSelectState(ImGuiID id) { ImGuiContext& g = *GImGui; return (id != 0 && g.BoxSelectState.ID == id && g.BoxSelectState.IsActive) ? &g.BoxSelectState : NULL; }
+
     // Internal Columns API (this is not exposed because we will encourage transitioning to the Tables API)
     IMGUI_API void          SetWindowClipRectBeforeSetChannel(ImGuiWindow* window, const ImRect& clip_rect);
     IMGUI_API void          BeginColumns(const char* str_id, int count, ImGuiOldColumnFlags flags = 0); // setup number of columns. use an identifier to distinguish multiple column sets. close with EndColumns().
@@ -3728,7 +3819,6 @@ namespace ImGui
     IMGUI_API void          TreePushOverrideID(ImGuiID id);
     IMGUI_API void          TreeNodeSetOpen(ImGuiID id, bool open);
     IMGUI_API bool          TreeNodeUpdateNextOpen(ImGuiID id, ImGuiTreeNodeFlags flags);   // Return open state. Consume previous SetNextItemOpen() data, if any. May return true when logging.
-    IMGUI_API void          SetNextItemSelectionUserData(ImGuiSelectionUserData selection_user_data);
 
     // Template functions are instantiated in imgui_widgets.cpp for a finite number of types.
     // To use them externally (for custom widget) you may need an "extern template" statement in your code in order to link to existing instances and silence Clang warnings (see #2036).
@@ -3807,6 +3897,7 @@ namespace ImGui
     IMGUI_API void          DebugNodeTableSettings(ImGuiTableSettings* settings);
     IMGUI_API void          DebugNodeInputTextState(ImGuiInputTextState* state);
     IMGUI_API void          DebugNodeTypingSelectState(ImGuiTypingSelectState* state);
+    IMGUI_API void          DebugNodeMultiSelectState(ImGuiMultiSelectState* state);
     IMGUI_API void          DebugNodeWindow(ImGuiWindow* window, const char* label);
     IMGUI_API void          DebugNodeWindowSettings(ImGuiWindowSettings* settings);
     IMGUI_API void          DebugNodeWindowsList(ImVector<ImGuiWindow*>* windows, const char* label);

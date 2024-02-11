@@ -42,6 +42,7 @@ Index of this file:
 // [SECTION] ImGuiIO
 // [SECTION] Misc data structures (ImGuiInputTextCallbackData, ImGuiSizeCallbackData, ImGuiWindowClass, ImGuiPayload)
 // [SECTION] Helpers (ImGuiOnceUponAFrame, ImGuiTextFilter, ImGuiTextBuffer, ImGuiStorage, ImGuiListClipper, Math Operators, ImColor)
+// [SECTION] Multi-Select API flags and structures (ImGuiMultiSelectFlags, ImGuiSelectionRequestType, ImGuiSelectionRequest, ImGuiMultiSelectIO, ImGuiSelectionBasicStorage)
 // [SECTION] Drawing API (ImDrawCallback, ImDrawCmd, ImDrawIdx, ImDrawVert, ImDrawChannel, ImDrawListSplitter, ImDrawFlags, ImDrawListFlags, ImDrawList, ImDrawData)
 // [SECTION] Font API (ImFontConfig, ImFontGlyph, ImFontGlyphRangesBuilder, ImFontAtlasFlags, ImFontAtlas, ImFont)
 // [SECTION] Viewports (ImGuiViewportFlags, ImGuiViewport)
@@ -158,11 +159,14 @@ struct ImGuiIO;                     // Main configuration and I/O between your a
 struct ImGuiInputTextCallbackData;  // Shared state of InputText() when using custom ImGuiInputTextCallback (rare/advanced use)
 struct ImGuiKeyData;                // Storage for ImGuiIO and IsKeyDown(), IsKeyPressed() etc functions.
 struct ImGuiListClipper;            // Helper to manually clip large list of items
+struct ImGuiMultiSelectIO;          // Structure to interact with a BeginMultiSelect()/EndMultiSelect() block
 struct ImGuiOnceUponAFrame;         // Helper for running a block of code not more than once a frame
 struct ImGuiPayload;                // User data payload for drag and drop operations
 struct ImGuiPlatformIO;             // Multi-viewport support: interface for Platform/Renderer backends + viewports to render
 struct ImGuiPlatformMonitor;        // Multi-viewport support: user-provided bounds for each connected monitor/display. Used when positioning popups and tooltips to avoid them straddling monitors
 struct ImGuiPlatformImeData;        // Platform IME data for io.SetPlatformImeDataFn() function.
+struct ImGuiSelectionBasicStorage;  // Helper struct to store multi-selection state + apply multi-selection requests.
+struct ImGuiSelectionRequest;       // A selection request (stored in ImGuiMultiSelectIO)
 struct ImGuiSizeCallbackData;       // Callback data when using SetNextWindowSizeConstraints() (rare/advanced use)
 struct ImGuiStorage;                // Helper for key->value storage
 struct ImGuiStyle;                  // Runtime data for styling/colors
@@ -210,6 +214,7 @@ typedef int ImGuiHoveredFlags;      // -> enum ImGuiHoveredFlags_    // Flags: f
 typedef int ImGuiInputTextFlags;    // -> enum ImGuiInputTextFlags_  // Flags: for InputText(), InputTextMultiline()
 typedef int ImGuiKeyChord;          // -> ImGuiKey | ImGuiMod_XXX    // Flags: for IsKeyChordPressed(), Shortcut() etc. an ImGuiKey optionally OR-ed with one or more ImGuiMod_XXX values.
 typedef int ImGuiPopupFlags;        // -> enum ImGuiPopupFlags_      // Flags: for OpenPopup*(), BeginPopupContext*(), IsPopupOpen()
+typedef int ImGuiMultiSelectFlags;  // -> enum ImGuiMultiSelectFlags_// Flags: for BeginMultiSelect()
 typedef int ImGuiSelectableFlags;   // -> enum ImGuiSelectableFlags_ // Flags: for Selectable()
 typedef int ImGuiSliderFlags;       // -> enum ImGuiSliderFlags_     // Flags: for DragFloat(), DragInt(), SliderFloat(), SliderInt() etc.
 typedef int ImGuiTabBarFlags;       // -> enum ImGuiTabBarFlags_     // Flags: for BeginTabBar()
@@ -245,6 +250,11 @@ typedef signed int          ImS32;  // 32-bit signed integer == int
 typedef unsigned int        ImU32;  // 32-bit unsigned integer (often used to store packed colors)
 typedef signed   long long  ImS64;  // 64-bit signed integer
 typedef unsigned long long  ImU64;  // 64-bit unsigned integer
+
+// Multi-Selection item index or identifier when using BeginMultiSelect()
+// - Used by SetNextItemSelectionUserData() + and inside ImGuiMultiSelectIO structure.
+// - Most users are likely to use this store an item INDEX but this may be used to store a POINTER/ID as well. Read comments near ImGuiMultiSelectIO for details.
+typedef ImS64 ImGuiSelectionUserData;
 
 // Character types
 // (we generally use UTF-8 encoded string in the API. This is storage specifically for a decoded character used for keyboard input and display)
@@ -657,6 +667,15 @@ namespace ImGui
     // - Neighbors selectable extend their highlight bounds in order to leave no gap between them. This is so a series of selected Selectable appear contiguous.
     IMGUI_API bool          Selectable(const char* label, bool selected = false, ImGuiSelectableFlags flags = 0, const ImVec2& size = ImVec2(0, 0)); // "bool selected" carry the selection state (read-only). Selectable() is clicked is returns true so you can modify your selection state. size.x==0.0: use remaining width, size.x>0.0: specify width. size.y==0.0: use label height, size.y>0.0: specify height
     IMGUI_API bool          Selectable(const char* label, bool* p_selected, ImGuiSelectableFlags flags = 0, const ImVec2& size = ImVec2(0, 0));      // "bool* p_selected" point to the selection state (read-write), as a convenient helper.
+
+    // Multi-selection system for Selectable() and TreeNode() functions.
+    // - This enables standard multi-selection/range-selection idioms (CTRL+Mouse/Keyboard, SHIFT+Mouse/Keyboard, etc.) in a way that also allow a clipper to be used.
+    // - ImGuiSelectionUserData is often used to store your item index.
+    // - Read comments near ImGuiMultiSelectIO for instructions/details and see 'Demo->Widgets->Selection State & Multi-Select' for demo.
+    IMGUI_API ImGuiMultiSelectIO*   BeginMultiSelect(ImGuiMultiSelectFlags flags);
+    IMGUI_API ImGuiMultiSelectIO*   EndMultiSelect();
+    IMGUI_API void                  SetNextItemSelectionUserData(ImGuiSelectionUserData selection_user_data);
+    IMGUI_API bool                  IsItemToggledSelection();                                   // Was the last item selection state toggled? Useful if you need the per-item information _before_ reaching EndMultiSelect(). We only returns toggle _event_ in order to handle clipping correctly.
 
     // Widgets: List Boxes
     // - This is essentially a thin wrapper to using BeginChild/EndChild with the ImGuiChildFlags_FrameStyle flag for stylistic changes + displaying a label.
@@ -2675,6 +2694,143 @@ struct ImColor
     // FIXME-OBSOLETE: May need to obsolete/cleanup those helpers.
     inline void    SetHSV(float h, float s, float v, float a = 1.0f){ ImGui::ColorConvertHSVtoRGB(h, s, v, Value.x, Value.y, Value.z); Value.w = a; }
     static ImColor HSV(float h, float s, float v, float a = 1.0f)   { float r, g, b; ImGui::ColorConvertHSVtoRGB(h, s, v, r, g, b); return ImColor(r, g, b, a); }
+};
+
+//-----------------------------------------------------------------------------
+// [SECTION] Multi-Select API flags and structures (ImGuiMultiSelectFlags, ImGuiSelectionRequestType, ImGuiSelectionRequest, ImGuiMultiSelectIO, ImGuiSelectionBasicStorage)
+//-----------------------------------------------------------------------------
+
+#define IMGUI_HAS_MULTI_SELECT      // Multi-Select/Range-Select WIP branch // <-- This is currently _not_ in the top of imgui.h to prevent merge conflicts.
+
+// Multi-selection system
+// Also read: https://github.com/ocornut/imgui/wiki/Multi-Select
+// - Refer to 'Demo->Widgets->Selection State & Multi-Select' for demos using this.
+// - This system implements standard multi-selection idioms (CTRL+Mouse/Keyboard, SHIFT+Mouse/Keyboard, etc)
+//   with support for clipper (skipping non-visible items), box-select and many other details.
+// - TreeNode() and Selectable() are supported but custom widgets may use it as well.
+// - In the spirit of Dear ImGui design, your code owns actual selection data.
+//   This is designed to allow all kinds of selection storage you may use in your application e.g. set/map/hash.
+// - The work involved to deal with multi-selection differs whether you want to only submit visible items and
+//   clip others, or submit all items regardless of their visibility. Clipping items is more efficient and will
+//   allow you to deal with large lists (1k~100k items). See "Usage flow" section below for details.
+//   If you are not sure, always start without clipping! You can work your way to the optimized version afterwards.
+// TL;DR;
+// - Identify submitted items with SetNextItemSelectionUserData(), most likely using an index into your current data-set.
+// - Store and maintain actual selection data using persistent object identifiers.
+// - Usage flow:
+//     BEGIN - (1) Call BeginMultiSelect() and retrieve the ImGuiMultiSelectIO* result.
+//           - (2) Honor request list (Clear/SelectAll/SetRange requests) by updating your selection data. Same code as Step 6.
+//           - (3) [If using clipper] You need to make sure RangeSrcItem is always submitted. Calculate its index and pass to clipper.IncludeItemByIndex(). If storing indices in ImGuiSelectionUserData, a simple clipper.IncludeItemByIndex(ms_io->RangeSrcItem) call will work.
+//     LOOP  - (4) Submit your items with SetNextItemSelectionUserData() + Selectable()/TreeNode() calls.
+//     END   - (5) Call EndMultiSelect() and retrieve the ImGuiMultiSelectIO* result.
+//           - (6) Honor request list (Clear/SelectAll/SetRange requests) by updating your selection data. Same code as Step 2.
+//     If you submit all items (no clipper), Step 2 and 3 are optional and will be handled by each item themselves. It is fine to always honor those steps.
+// About ImGuiSelectionUserData:
+// - For each item is it submitted by your call to SetNextItemSelectionUserData().
+// - This can store an application-defined identifier (e.g. index or pointer).
+// - In return we store them into RangeSrcItem/RangeFirstItem/RangeLastItem and other fields in ImGuiMultiSelectIO.
+// - Most applications will store an object INDEX, hence the chosen name and type.
+//   Storing an integer index is the easiest thing to do, as SetRange requests will give you two end-points
+//   and you will need to iterate/interpolate between them to update your selection.
+// - However it is perfectly possible to store a POINTER or another IDENTIFIER inside this value!
+//   Our system never assume that you identify items by indices, it never attempts to interpolate between two values.
+// - As most users will want to store an index, for convenience and to reduce confusion we use ImS64 instead of void*,
+//   being syntactically easier to downcast. Feel free to reinterpret_cast and store a pointer inside.
+// - If you need to wrap this API for another language/framework, feel free to expose this as 'int' if simpler.
+// About ImGuiSelectionBasicStorage:
+// - This is an optional helper to store a selection state and apply selection requests.
+// - It is used by our demos and provided as a convenience if you want to quickly implement multi-selection.
+
+// Flags for BeginMultiSelect()
+enum ImGuiMultiSelectFlags_
+{
+    ImGuiMultiSelectFlags_None                  = 0,
+    ImGuiMultiSelectFlags_SingleSelect          = 1 << 0,   // Disable selecting more than one item. This is available to allow single-selection code to share same code/logic if desired. It essentially disables the main purpose of BeginMultiSelect() tho!
+    ImGuiMultiSelectFlags_NoSelectAll           = 1 << 1,   // Disable CTRL+A shortcut sending a SelectAll request.
+    ImGuiMultiSelectFlags_NoRangeSelect         = 1 << 2,   // Disable Shift+Click/Shift+Keyboard handling (useful for unordered 2D selection).
+    ImGuiMultiSelectFlags_BoxSelect             = 1 << 3,   // Enable box-selection (only supporting 1D list when using clipper, not 2D grids). Box-selection works better with little bit of spacing between items hit-box in order to be able to aim at empty space.
+    ImGuiMultiSelectFlags_BoxSelect2d           = 1 << 4,   // Enable box-selection with 2D layout/grid support. This alters clipping logic so that e.g. horizontal movements will update selection of normally clipped items.
+    ImGuiMultiSelectFlags_BoxSelectNoScroll     = 1 << 5,   // Disable scrolling when box-selecting near edges of scope.
+    ImGuiMultiSelectFlags_ClearOnEscape         = 1 << 6,   // Clear selection when pressing Escape while scope is focused.
+    ImGuiMultiSelectFlags_ClearOnClickVoid      = 1 << 7,   // Clear selection when clicking on empty location within scope.
+    ImGuiMultiSelectFlags_ScopeWindow           = 1 << 8,   // Use if BeginMultiSelect() covers a whole window (Default): Scope for _ClearOnClickVoid and _BoxSelect is whole window (Default).
+    ImGuiMultiSelectFlags_ScopeRect             = 1 << 9,   // Use if multiple BeginMultiSelect() are used in the same host window: Scope for _ClearOnClickVoid and _BoxSelect is rectangle covering submitted items.
+    ImGuiMultiSelectFlags_SelectOnClick         = 1 << 10,  // Apply selection on mouse down when clicking on unselected item. (Default)
+    ImGuiMultiSelectFlags_SelectOnClickRelease  = 1 << 11,  // Apply selection on mouse release when clicking an unselected item. Allow dragging an unselected item without altering selection.
+};
+
+// Main IO structure returned by BeginMultiSelect()/EndMultiSelect().
+// This mainly contains a list of selection requests.
+// - Use 'Demo->Tools->Debug Log->Selection' to see requests as they happen.
+// - Some fields are only useful if your list is dynamic and allows deletion (getting post-deletion focus/state right is shown in the demo)
+// - Below: who reads/writes each fields? 'r'=read, 'w'=write, 'ms'=multi-select code, 'app'=application/user code.
+struct ImGuiMultiSelectIO
+{
+    //------------------------------------------// BeginMultiSelect / EndMultiSelect
+    ImVector<ImGuiSelectionRequest> Requests;   //  ms:w, app:r     /  ms:w  app:r   // Requests to apply to your selection data.
+    ImGuiSelectionUserData      RangeSrcItem;   //  ms:w  app:r     /                // (If using clipper) Begin: Source item (generally the first selected item when multi-selecting, which is used as a reference point) must never be clipped!
+    ImGuiSelectionUserData      NavIdItem;      //  ms:w, app:r     /                // (If using deletion) Last known SetNextItemSelectionUserData() value for NavId (if part of submitted items).
+    bool                        NavIdSelected;  //  ms:w, app:r     /        app:r   // (If using deletion) Last known selection state for NavId (if part of submitted items).
+    bool                        RangeSrcReset;  //        app:w     /  ms:r          // (If using deletion) Set before EndMultiSelect() to reset ResetSrcItem (e.g. if deleted selection).
+};
+
+// Selection request type
+enum ImGuiSelectionRequestType
+{
+    ImGuiSelectionRequestType_None = 0,
+    ImGuiSelectionRequestType_Clear,            // Request app to clear selection.
+    ImGuiSelectionRequestType_SelectAll,        // Request app to select all.
+    ImGuiSelectionRequestType_SetRange,         // Request app to select/unselect [RangeFirstItem..RangeLastItem] items based on 'bool RangeSelected'. Only EndMultiSelect() request this, app code can read after BeginMultiSelect() and it will always be false.
+};
+
+// Selection request item
+struct ImGuiSelectionRequest
+{
+    //------------------------------------------// BeginMultiSelect / EndMultiSelect
+    ImGuiSelectionRequestType   Type;           //  ms:w, app:r     /  ms:w, app:r   // Request type. You'll most often receive 1 Clear + 1 SetRange with a single-item range.
+    bool                        RangeSelected;  //                  /  ms:w, app:r   // Parameter for SetRange request (true = select range, false = unselect range)
+    ImGuiSelectionUserData      RangeFirstItem; //                  /  ms:w, app:r   // Parameter for SetRange request (this is generally == RangeSrcItem when shift selecting from top to bottom)
+    ImGuiSelectionUserData      RangeLastItem;  //                  /  ms:w, app:r   // Parameter for SetRange request (this is generally == RangeSrcItem when shift selecting from bottom to top)
+};
+
+// Optional helper to store multi-selection state + apply multi-selection requests.
+// - Used by our demos and provided as a convenience to easily implement basic multi-selection.
+// - USING THIS IS NOT MANDATORY. This is only a helper and not a required API. Advanced users are likely to implement their own.
+// To store a multi-selection, in your application you could:
+// - A) Use this helper as a convenience. We use our simple key->value ImGuiStorage as a std::set<ImGuiID> replacement.
+// - B) Use your own external storage: e.g. std::set<MyObjectId>, std::vector<MyObjectId>, interval trees, etc.
+// - C) Use intrusively stored selection (e.g. 'bool IsSelected' inside objects). Not recommended because you can't have multiple views
+//      over same objects. Also some features requires to provide selection _size_, which with this strategy requires additional work.
+// In ImGuiSelectionBasicStorage we:
+// - always use indices in the multi-selection API (passed to SetNextItemSelectionUserData(), retrieved in ImGuiMultiSelectIO)
+// - use the AdapterIndexToStorageId() indirection layer to abstract how persistent selection data is derived from an index.
+//   - so this helper can be used regardless of your object storage/types, and without using templates or virtual functions.
+//   - in some cases we read an ID from some custom item data structure (similar to what you would do in your codebase)
+//   - in some cases we use Index as custom identifier (default implementation returns Index cast as Identifier): only OK for a never changing item list.
+// Many combinations are possible depending on how you prefer to store your items and how you prefer to store your selection.
+// When your application settles on a choice, you may want to get rid of this indirection layer and do your own thing.
+// See https://github.com/ocornut/imgui/wiki/Multi-Select for minimum pseudo-code example using this helper.
+// (In theory, for maximum abstraction, this class could contains AdapterIndexToUserData() and AdapterUserDataToIndex() functions as well,
+// but because we always use indices in SetNextItemSelectionUserData() in the demo, we omit that indirection for clarity.)
+struct ImGuiSelectionBasicStorage
+{
+    // Members
+    ImGuiStorage    Storage;        // [Internal] Selection set. Think of this as similar to e.g. std::set<ImGuiID>
+    int             Size;           // Number of selected items (== number of 1 in the Storage, maintained by this class).
+    void*           AdapterData;    // Adapter to convert item index to item identifier     // e.g. selection.AdapterData = (void*)my_items;
+    ImGuiID         (*AdapterIndexToStorageId)(ImGuiSelectionBasicStorage* self, int idx);  // e.g. selection.AdapterIndexToStorageId = [](ImGuiSelectionBasicStorage* self, int idx) { return ((MyItems**)self->AdapterData)[idx]->ID; };
+
+    // Methods: selection storage
+    ImGuiSelectionBasicStorage()                { Clear(); AdapterData = NULL; AdapterIndexToStorageId = [](ImGuiSelectionBasicStorage*, int idx) { return (ImGuiID)idx; }; }
+    void    Clear()                             { Storage.Data.resize(0); Size = 0; }
+    void    Swap(ImGuiSelectionBasicStorage& r) { Storage.Data.swap(r.Storage.Data); }
+    bool    Contains(ImGuiID key) const         { return Storage.GetInt(key, 0) != 0; }
+    void    AddItem(ImGuiID key)                { int* p_int = Storage.GetIntRef(key, 0); if (*p_int != 0) return; *p_int = 1; Size++; }
+    void    RemoveItem(ImGuiID key)             { int* p_int = Storage.GetIntRef(key, 0); if (*p_int == 0) return; *p_int = 0; Size--; }
+    void    UpdateItem(ImGuiID key, bool v)     { if (v) { AddItem(key); } else { RemoveItem(key); } }
+
+    // Methods: apply selection requests (that are coming from BeginMultiSelect() and EndMultiSelect() functions)
+    IMGUI_API void ApplyRequests(ImGuiMultiSelectIO* ms_io, int items_count);
 };
 
 //-----------------------------------------------------------------------------
