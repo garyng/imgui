@@ -1,3 +1,8 @@
+
+This branch is updated with `master`, `docking`, and `features/range_select` from the upstream.
+
+---
+
 Dear ImGui
 =====
 
